@@ -72,3 +72,34 @@ echo "================================================="
 echo "Completed"
 echo "CSV Report: $CSV_FILE"
 echo "================================================="
+
+----------------------------------------------
+#!/bin/bash
+
+NODES_FILE="nodes.txt"
+NAMESPACE="cortex"     # change if required
+POD_PATTERN="cortex"
+
+if [ ! -f "$NODES_FILE" ]; then
+    echo "File $NODES_FILE not found"
+    exit 1
+fi
+
+while read -r NODE
+do
+    [ -z "$NODE" ] && continue
+
+    echo "Processing node: $NODE"
+
+    oc get pods -n "$NAMESPACE" -o wide --no-headers | \
+    awk -v node="$NODE" -v pattern="$POD_PATTERN" '
+        $0 ~ pattern && $8 == node { print $1 }
+    ' | while read -r POD
+    do
+        echo "Deleting pod: $POD from node: $NODE"
+
+        # Uncomment after verification
+        oc delete pod "$POD" -n "$NAMESPACE"
+    done
+
+done < "$NODES_FILE"
