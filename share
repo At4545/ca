@@ -1,0 +1,5 @@
+
+oc get groups -o json | jq -r '
+.items[].users[]? |
+select(test("@hcsc\\.com$"; "i"))
+' | sort -u
