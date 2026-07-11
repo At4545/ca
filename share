@@ -103,3 +103,14 @@ do
     done
 
 done < "$NODES_FILE"
+
+
+----
+
+oc get pods -n "$NAMESPACE" -o json | jq -r \
+  --arg node "$NODE" \
+  '.items[]
+   | select(.spec.nodeName==$node)
+   | select(.metadata.name | test("cortex"))
+   | .metadata.name'
+
