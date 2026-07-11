@@ -1,116 +1,78 @@
-
 #!/bin/bash
 
-CSV_FILE="hcsc_identity_cleanup_$(date +%Y%m%d_%H%M%S).csv"
+#########################################
+# Configuration
+#########################################
 
-echo "new_user,old_user,old_identity,migrated" > "$CSV_FILE"
-
-echo "Collecting HCSC users from groups..."
-
-oc get groups -o json | jq -r '
-.items[].users[]? |
-select(test("@hcsc\\.com$"; "i"))
-' | sort -u | while read -r new_user
-do
-
-    echo "Processing: $new_user"
-
-    #
-    # Check if new user already exists
-    #
-    if oc get user "$new_user" >/dev/null 2>&1; then
-
-        echo "$new_user,,,YES" >> "$CSV_FILE"
-        echo "  -> Migrated user already exists. Skipping."
-
-        continue
-    fi
-
-    #
-    # User does not exist yet.
-    # Find old accounts.
-    #
-    username="${new_user%@hcsc.com}"
-
-    oc get users -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
-    | grep "^${username}@" \
-    | grep -v "@hcsc.com$" \
-    | while read -r old_user
-    do
-
-        old_identity=$(oc get identities -o json | jq -r --arg USER "$old_user" '
-            .items[]
-            | select(.user.name == $USER)
-            | .metadata.name
-        ')
-
-        #
-        # Save to CSV
-        #
-        echo "$new_user,$old_user,$old_identity,NO" >> "$CSV_FILE"
-
-        echo "  Old User     : $old_user"
-        echo "  Old Identity : $old_identity"
-
-        #
-        # Delete old identity
-        #
-        if [ -n "$old_identity" ] && [ "$old_identity" != "null" ]; then
-
-            echo "  Deleting identity: $old_identity"
-
-            oc delete identity "$old_identity"
-
-        fi
-
-    done
-
-done
-
-echo
-echo "================================================="
-echo "Completed"
-echo "CSV Report: $CSV_FILE"
-echo "================================================="
-
-----------------------------------------------
-#!/bin/bash
-
-NODES_FILE="nodes.txt"
-NAMESPACE="cortex"     # change if required
+NAMESPACE="openshift-monitoring"   # Change if needed
 POD_PATTERN="cortex"
+NODES_FILE="nodes.txt"
+
+# true = only show pods
+# false = actually delete pods
+DRY_RUN=true
+
+CSV_REPORT="cortex_pod_cleanup_$(date +%Y%m%d_%H%M%S).csv"
+
+#########################################
+# Validation
+#########################################
 
 if [ ! -f "$NODES_FILE" ]; then
-    echo "File $NODES_FILE not found"
+    echo "ERROR: $NODES_FILE not found"
     exit 1
 fi
+
+echo "node,pod_name,action" > "$CSV_REPORT"
+
+#########################################
+# Process Nodes
+#########################################
 
 while read -r NODE
 do
     [ -z "$NODE" ] && continue
 
-    echo "Processing node: $NODE"
+    echo "========================================="
+    echo "Processing Node: $NODE"
+    echo "========================================="
 
-    oc get pods -n "$NAMESPACE" -o wide --no-headers | \
-    awk -v node="$NODE" -v pattern="$POD_PATTERN" '
-        $0 ~ pattern && $8 == node { print $1 }
-    ' | while read -r POD
-    do
-        echo "Deleting pod: $POD from node: $NODE"
+    oc get pods -n "$NAMESPACE" -o json | jq -r \
+      --arg node "$NODE" \
+      --arg pattern "$POD_PATTERN" '
+        .items[]
+        | select(.spec.nodeName==$node)
+        | select(.metadata.name | test($pattern))
+        | .metadata.name
+      ' | while read -r POD
+      do
 
-        # Uncomment after verification
-        oc delete pod "$POD" -n "$NAMESPACE"
-    done
+          [ -z "$POD" ] && continue
+
+          if [ "$DRY_RUN" = true ]; then
+
+              echo "[DRY RUN] Would delete pod: $POD"
+
+              echo "$NODE,$POD,DRY_RUN" \
+              >> "$CSV_REPORT"
+
+          else
+
+              echo "Deleting pod: $POD"
+
+              oc delete pod "$POD" -n "$NAMESPACE"
+
+              echo "$NODE,$POD,DELETED" \
+              >> "$CSV_REPORT"
+
+          fi
+
+      done
 
 done < "$NODES_FILE"
 
-
-----
-
-oc get pods -n "$NAMESPACE" -o json | jq -r \
-  --arg node "$NODE" \
-  '.items[]
-   | select(.spec.nodeName==$node)
-   | select(.metadata.name | test("cortex"))
-   | .metadata.name'
-
+echo ""
+echo "========================================="
+echo "Completed"
+echo "Report: $CSV_REPORT"
+echo "========================================="
