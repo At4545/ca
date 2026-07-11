@@ -3,3 +3,59 @@ oc get groups -o json | jq -r '
 .items[].users[]? |
 select(test("@hcsc\\.com$"; "i"))
 ' | sort -u
+----------------------------
+#!/bin/bash
+
+CSV_FILE="hcsc_identity_cleanup.csv"
+
+echo "new_user,old_user,old_identity,migrated" > "$CSV_FILE"
+
+# Get all HCSC users from groups
+oc get groups -o json | jq -r '
+.items[].users[]? |
+select(test("@hcsc\\.com$"; "i"))
+' | sort -u | while read -r new_user
+do
+    echo "Processing: $new_user"
+
+    # Check whether new user already exists
+    if oc get user "$new_user" >/dev/null 2>&1; then
+        echo "  New user exists -> SKIP"
+
+        echo "$new_user,,,YES" >> "$CSV_FILE"
+        continue
+    fi
+
+    user_prefix="${new_user%@hcsc.com}"
+
+    # Find matching old users
+    oc get users -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+*   | grep "^${user_prefix}@" \
+   *| grep -v "@hcsc.com$" \
+    | whi*e read -r old_user
+      do
+
+     *    # Find associated identity
+   *      old_identity=$(oc get identi*ies -o json | jq -r --arg USER "$o*d_user" '
+            .items[]
+   *        | select(.user.name==$USER*
+            | .metadata.name
+    *     ')
+
+          echo "$new_user*$old_user,$old_identity,NO" >> "$C*V_FILE"
+
+          echo "  Old Use*     : $old_user"
+          echo "* Old Identity : $old_identity"
+
+  *       # Delete old identity
+     *    if [ -n "$old_identity" ]; the*
+              oc delete identity *$old_identity"
+          fi
+
+     *done
+
+done
+
+echo
+echo "CSV Report *aved:"
+echo "$CSV_FILE"
