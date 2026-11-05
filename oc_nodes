@@ -1,0 +1,263 @@
+#!/usr/bin/python3 -S
+"""FAKE `oc` for the NODE-LEVEL capture tests ONLY (stdlib, -S for fast start-up).
+
+Adds to the plain fake `oc` that sits next to this file:
+  * `oc debug node/NAME ... -- sh -c SCRIPT portal ARGS...`   (discovery phase and capture phase)
+  * `oc get node NAME`, `oc get namespaces`, `oc auth can-i get nodes|use scc/privileged`
+  * `get pod(s)` answers that include spec.nodeName, plus synthetic pods named nd-* that select failure modes.
+Everything else (login, exec, thread/heap dumps, in-container tcpdump ...) is delegated to the plain fake.
+It proves the portal's logic against the commands' documented behaviour; it cannot prove real cluster behaviour.
+
+The plain fake is started THROUGH THE PYTHON INTERPRETER that is running this file (not by executing it), so it does not
+matter whether tests/bin/oc has lost its execute permission, has Windows line endings in its first line, or names an
+interpreter path that does not exist on this machine.
+
+Scenario pods (node-level):  nd-ok nd-nocrictl nd-twopods nd-notools nd-badns nd-hostnet nd-forbidden nd-garbage
+nd-nomarker nd-noise nd-rc1 nd-huge nd-slow nd-stuck nd-leftover nd-notready nd-badnode nd-nonode
+Users: alice, dave (cluster-admin-like); bob (no node/scc rights); carol (can read nodes, no privileged scc).
+"""
+import hashlib, json, os, struct, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.join(HERE, "oc")
+PYTHON = sys.executable or "python3"
+TMP = os.environ.get("TMPDIR", "/tmp")
+DEBUG_LOG = os.path.join(TMP, "fake-debug.log")
+NS_FILE = os.path.join(TMP, "debug-ns.json")
+args = sys.argv[1:]
+
+ND_PODS = ["nd-ok", "nd-nocrictl", "nd-twopods", "nd-notools", "nd-badns", "nd-hostnet", "nd-forbidden", "nd-garbage",
+           "nd-nomarker", "nd-noise", "nd-rc1", "nd-huge", "nd-slow", "nd-stuck", "nd-leftover", "nd-notready", "nd-badnode", "nd-nonode"]
+SCRIPT_MARK_DISCOVER, SCRIPT_MARK_CAPTURE = "podcount", "PORTAL-PCAP-BEGIN"
+
+
+def die(msg, rc=1):
+    sys.stderr.write(msg + "\n")
+    sys.exit(rc)
+
+
+if not os.path.isfile(BASE):
+    die("test setup problem: the plain fake 'oc' was not found at %s (it ships in tests/bin/ of the 1.0/1.1 release)" % BASE, 3)
+
+
+def delegate():
+    os.execv(PYTHON, [PYTHON, "-S", BASE] + args)
+
+
+def run_base(extra=None):
+    return subprocess.run([PYTHON, "-S", BASE] + (extra if extra is not None else args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True)
+
+
+def whoami():
+    r = run_base(["whoami"])
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        sys.exit(r.returncode)
+    return r.stdout.strip()
+
+
+def node_for(pod):
+    return {"nd-notready": "worker-notready.example", "nd-badnode": "Bad_Node!", "nd-nonode": ""}.get(pod, "worker-1.example")
+
+
+def nd_pod(name):
+    return {"metadata": {"name": name}, "spec": {"containers": [{"name": "app"}], "nodeName": node_for(name)},
+            "status": {"phase": "Running", "containerStatuses": [{"name": "app", "ready": True, "restartCount": 0, "state": {"running": {}}}]}}
+
+
+def patch_pod(item):
+    item.setdefault("spec", {})["nodeName"] = node_for(item["metadata"]["name"])
+    return item
+
+
+# ---------------------------------------------------------------------------------------------- namespaces state
+def ns_load():
+    if os.path.exists(NS_FILE):
+        with open(NS_FILE) as fh:
+            return json.load(fh)
+    return [{"name": "openshift-debug-oldone", "phase": "Terminating"}]
+
+
+def ns_save(items):
+    with open(NS_FILE, "w") as fh:
+        json.dump(items, fh)
+
+
+def ns_add(name, phase="Active"):
+    items = ns_load()
+    items.append({"name": name, "phase": phase})
+    ns_save(items)
+
+
+def ns_remove(name):
+    ns_save([i for i in ns_load() if i["name"] != name])
+
+
+# ---------------------------------------------------------------------------------------------- simple read commands
+pos = [a for a in args if not a.startswith("-")]
+flags_o = args[args.index("-o") + 1] if "-o" in args else None
+
+if pos[:2] == ["get", "pod"] or pos[:2] == ["get", "pods"]:
+    r = run_base()
+    one = pos[1] == "pod"
+    if one and r.returncode != 0 and "NotFound" in r.stderr and len(pos) > 2 and pos[2] in ND_PODS:
+        print(json.dumps(nd_pod(pos[2])))
+        sys.exit(0)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        sys.exit(r.returncode)
+    data = json.loads(r.stdout)
+    if one:
+        data = patch_pod(data)
+    else:
+        data["items"] = [patch_pod(i) for i in data.get("items", [])] + [nd_pod(n) for n in ND_PODS]
+    print(json.dumps(data))
+    sys.exit(0)
+
+if pos[:2] == ["get", "node"] and len(pos) > 2:
+    ident = whoami()
+    if ident == "bob":
+        die('Error from server (Forbidden): nodes "%s" is forbidden: User "bob" cannot get resource "nodes" in API group "" at the cluster scope' % pos[2])
+    if pos[2] not in ("worker-1.example", "worker-notready.example"):
+        die('Error from server (NotFound): nodes "%s" not found' % pos[2])
+    ready = "False" if pos[2] == "worker-notready.example" else "True"
+    print(json.dumps({"metadata": {"name": pos[2]}, "status": {"conditions": [{"type": "MemoryPressure", "status": "False"}, {"type": "Ready", "status": ready}]}}))
+    sys.exit(0)
+
+if pos[:2] == ["get", "namespaces"]:
+    ident = whoami()
+    if ident == "bob":
+        die('Error from server (Forbidden): namespaces is forbidden: User "bob" cannot list resource "namespaces" in API group "" at the cluster scope')
+    items = [{"metadata": {"name": n}, "status": {"phase": "Active"}} for n in ("kube-system", "demo-dev", "demo-prod")]
+    items += [{"metadata": {"name": i["name"]}, "status": {"phase": i["phase"]}} for i in ns_load()]
+    print(json.dumps({"items": items}))
+    sys.exit(0)
+
+if pos[:2] == ["auth", "can-i"] and pos[2:4] in (["get", "nodes"], ["use", "scc/privileged"]):
+    ident = whoami()
+    node_ok = ident != "bob"
+    scc_ok = ident not in ("bob", "carol")
+    ans = node_ok if pos[2] == "get" else scc_ok
+    print("yes" if ans else "no")
+    sys.exit(0 if ans else 1)
+
+if pos[:1] != ["debug"]:
+    delegate()
+
+# ---------------------------------------------------------------------------------------------- oc debug node/...
+ident = whoami()                                  # authenticates the token, the cluster and TLS exactly like the plain fake
+if "--" not in args:
+    die("error: this fake only supports `oc debug node/NAME ... -- sh -c SCRIPT portal ARGS`", 2)
+i = args.index("--")
+before, cmd = args[:i], args[i + 1:]
+node = next((a[5:] for a in before if a.startswith("node/")), None)
+image = next((a[8:] for a in before if a.startswith("--image=")), None)
+log = {"argv": args, "ident": ident, "node": node, "image": image, "no_stdin": "--no-stdin" in before, "tty_false": "--tty=false" in before,
+       "violations": [], "script_sha": None, "mode": None}
+if any("sha256~" in a for a in args):
+    log["violations"].append("token in argv")
+if any("sha256~" in v for v in os.environ.values()):
+    log["violations"].append("token in environment")
+if node is None or cmd[:2] != ["sh", "-c"] or len(cmd) < 4 or cmd[3] != "portal":
+    log["violations"].append("unexpected argv shape")
+    with open(DEBUG_LOG, "a") as fh:
+        fh.write(json.dumps(log) + "\n")
+    die("error: unexpected arguments", 2)
+script, sargs = cmd[2], cmd[4:]
+log["script_sha"] = hashlib.sha256(script.encode()).hexdigest()
+log["mode"] = "discover" if SCRIPT_MARK_DISCOVER in script else "capture" if SCRIPT_MARK_CAPTURE in script else "other"
+log["args"] = sargs
+with open(DEBUG_LOG, "a") as fh:
+    fh.write(json.dumps(log) + "\n")
+
+if ident == "bob":
+    die('Error from server (Forbidden): pods "%s-debug" is forbidden: User "bob" cannot create resource "pods" in API group "" in the namespace "default"' % node)
+tmp_ns = "openshift-debug-tmp%d" % os.getpid()
+sys.stderr.write("Temporary namespace %s is created for debugging node...\nStarting pod/%s-debug ...\n" % (tmp_ns, node.replace(".", "")))
+ns_add(tmp_ns)
+
+
+def finish(rc=0, err=None):
+    if err:
+        sys.stderr.write(err)
+    sys.stderr.write("Removing debug pod ...\nTemporary namespace %s was removed.\n" % tmp_ns)
+    ns_remove(tmp_ns)
+    sys.exit(rc)
+
+
+if log["mode"] == "discover":
+    namespace, regex = sargs[0], sargs[1]
+    pod = regex[1:-1].replace("\\.", ".") if regex.startswith("^") and regex.endswith("$") else regex
+    if pod == "nd-forbidden":
+        ns_remove(tmp_ns)
+        die('Error from server (Forbidden): pods "%s-debug" is forbidden: User "%s" cannot create resource "pods/attach" ...' % (node, ident))
+    out = sys.stdout
+    if pod == "nd-noise":
+        out.write("Starting pod/%s-debug ...\nTo use host binaries, run `chroot /host`\n" % node.replace(".", ""))
+    for t in (("timeout",) if pod == "nd-notools" else ("tcpdump", "nsenter", "timeout")):
+        out.write("tool=%s\n" % t)
+    count = 0 if pod == "nd-nocrictl" else 2 if pod == "nd-twopods" else 1
+    out.write("podcount=%d\n" % count)
+    if count == 1:
+        podid = hashlib.sha256(pod.encode()).hexdigest()
+        out.write("podid=%s\n" % podid)
+        netns = {"path": "/etc/passwd"} if pod == "nd-badns" else {} if pod == "nd-hostnet" else {"path": "/var/run/netns/cni-%s-1a2b3c" % pod}
+        net = dict({"type": "network"}, **netns)
+        doc = {"status": {"id": podid, "metadata": {"name": pod, "namespace": namespace}},
+               "info": {"runtimeSpec": {"linux": {"namespaces": [{"type": "pid"}, net, {"type": "ipc"}, {"type": "uts"}]}}}}
+        out.write("json-begin\n" + json.dumps(doc, indent=2) + "\njson-end\n")
+    out.flush()
+    finish(0)
+
+# ---- capture phase: sargs = duration, netns, snaplen, count, expression
+duration, netns, snap, count, expr = int(sargs[0]), sargs[1], int(sargs[2]), sargs[3], sargs[4] if len(sargs) > 4 else ""
+pod = netns.rsplit("/", 1)[-1][4:].rsplit("-", 1)[0] if netns.startswith("/var/run/netns/cni-") else ""
+out = sys.stdout.buffer
+
+
+def hdr(s):
+    return struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, s, 113)
+
+
+def pkt(data):
+    return struct.pack("<IIII", int(time.time()), 0, len(data), len(data)) + data
+
+
+if pod == "nd-nomarker":
+    ns_remove(tmp_ns)
+    die("error: unable to pull image: ErrImagePull: rpc error: pull access denied", 1)
+if pod == "nd-noise":
+    out.write(b"Starting pod/%s-debug ...\nTo use host binaries, run `chroot /host`\n" % node.replace(".", "").encode())
+out.write(b"PORTAL-PCAP-BEGIN\n")
+out.flush()
+if not pod:        # the portal passed a namespace path the node does not know
+    ns_remove(tmp_ns)
+    die("nsenter: reassociate to namespace 'ns/net' failed: No such file or directory", 1)
+if pod == "nd-garbage":
+    out.write(b"hello world")
+    out.flush()
+    finish(0)
+out.write(hdr(snap))
+meta = ("node=%s|image=%s|expr=%s|snap=%d|secs=%d|c=%s" % (node, image or "-", expr, snap, duration, count)).encode()
+for k in range(3):
+    out.write(pkt(meta + b"|n=%d" % k))
+if pod == "nd-huge":
+    blob = b"x" * 1000
+    try:
+        for _ in range(4000):
+            out.write(pkt(blob))
+    except BrokenPipeError:
+        sys.exit(0)
+if pod == "nd-noise":
+    out.write(b"\nRemoving debug pod ...\n")
+out.flush()
+if pod in ("nd-slow", "nd-stuck"):
+    time.sleep(25)
+else:
+    time.sleep(min(duration, 1))
+if pod == "nd-leftover":                # the debug namespace is not cleaned up
+    sys.exit(124)
+if pod == "nd-rc1":
+    finish(1, "command terminated with exit code 124\n")
+finish(124)
